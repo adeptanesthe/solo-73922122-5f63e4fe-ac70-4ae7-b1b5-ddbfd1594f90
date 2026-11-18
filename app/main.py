@@ -6,13 +6,13 @@ single-worker executor so the event loop never blocks.
 Concurrency guarantees
 ----------------------
 * All mutations of one session are queued on that session's single worker and
-  applied in submission order.  Advancing or undoing while a confirmation's
+  applied in submission order.  Advancing, undoing or revising while another
   replay is still running is therefore safe: the later operation is applied to
   the post-replay state, and a slow earlier result can never overwrite it.
 * Every response carries a monotonically increasing ``revision``.  The UI drops
   any response whose revision is older than the state it already shows.
-* Validation errors do not mutate the session; the UI keeps its previous
-  subtitles and frame progress and merely shows the error.
+* Validation errors and failed revision replays do not mutate the session; the
+  UI keeps its previous subtitles and frame progress and merely shows the error.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from pydantic import BaseModel
 
 from .decoder import DecodeError
 from . import state as state_module
-from .state import SessionError, SessionManager
+from .state import RevisionError, SessionError, SessionManager
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -66,6 +66,14 @@ class ConfirmBody(BaseModel):
 
 class UndoBody(BaseModel):
     session_id: str
+
+
+class ReviseBody(BaseModel):
+    session_id: str
+    start_frame: int
+    # Replacement probability rows in the original vocabulary order
+    # (index 0 = blank), at most 16 consecutive rows.
+    rows: list[list[float]]
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +115,12 @@ async def _run_op(session, func, *args) -> dict:
     future = manager.submit(session, apply, func, args)
     try:
         return await asyncio.wrap_future(future)
+    except RevisionError as exc:
+        # Structured replay failure: the session itself was not mutated.
+        raise HTTPException(
+            status_code=409,
+            detail={"message": str(exc), **exc.details},
+        ) from exc
     except SessionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except DecodeError as exc:
@@ -264,6 +278,22 @@ async def confirm_endpoint(body: ConfirmBody) -> dict:
 async def undo_endpoint(body: UndoBody) -> dict:
     session = _session_or_404(body.session_id)
     return await _run_op(session, state_module.undo)
+
+
+@app.post("/api/revise")
+async def revise_endpoint(body: ReviseBody) -> dict:
+    """Locally replace up to 16 already-consumed frames and replay everything.
+
+    The replacement rows follow the original vocabulary order.  The server
+    re-runs the beam search and every confirmation at its original frame
+    number; on failure (beam lost or a confirmation no longer reachable) the
+    earliest failure point is returned with HTTP 409 and the session is kept
+    exactly as it was.
+    """
+    session = _session_or_404(body.session_id)
+    return await _run_op(
+        session, state_module.revise_frames, body.start_frame, body.rows
+    )
 
 
 # ---------------------------------------------------------------------------

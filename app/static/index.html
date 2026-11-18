@@ -146,6 +146,34 @@
       <ol class="history-list" id="history-list"></ol>
       <p class="empty" id="history-empty">还没有确认过前缀。</p>
     </div>
+
+    <div class="panel revise">
+      <div class="panel-head">
+        <h2>5. 局部帧修订（最多连续 16 帧）</h2>
+        <span class="hint">仅可修订已推进的帧；按原词表顺序填写新概率行，提交后整段重演。</span>
+      </div>
+      <div class="revise-controls">
+        <label class="inline">
+          起始帧
+          <input type="number" id="revise-start" min="0" step="1" value="0">
+        </label>
+        <label class="inline">
+          连续帧数
+          <input type="range" id="revise-count" min="1" max="16" step="1" value="1">
+          <span class="mono" id="revise-count-out">1</span>
+        </label>
+        <button class="ghost" id="revise-prefill" type="button">读取当前概率</button>
+        <button class="ghost" id="revise-normalize" type="button">每行归一化</button>
+        <button class="primary" id="revise-submit" type="button">提交修订并重演</button>
+      </div>
+      <div class="revise-grid-wrap">
+        <table class="revise-grid" id="revise-grid"></table>
+      </div>
+      <p class="error" id="revise-error" hidden></p>
+      <h3 class="revise-subhead">修订记录</h3>
+      <ol class="history-list" id="revise-list"></ol>
+      <p class="empty" id="revise-empty">还没有提交过局部修订。</p>
+    </div>
   </section>
 </main>
 

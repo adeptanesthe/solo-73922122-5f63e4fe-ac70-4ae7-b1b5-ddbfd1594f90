@@ -1,4 +1,5 @@
-"""Session state: streaming advance, prefix confirmation and exact undo.
+"""Session state: streaming advance, prefix confirmation, exact undo and local
+frame revision.
 
 Rules implemented here
 ----------------------
@@ -17,10 +18,18 @@ Rules implemented here
    the restriction changed which hypotheses survived pruning.  The correct
    state is obtained by replaying the frames consumed since the confirmation
    from the stored pre-confirmation beam, with the earlier prefix restriction.
-4. Operations for one session are submitted to a single-worker executor, so
-   they are applied in arrival order: advance / undo issued while a replay is
-   running are queued and see the post-replay state.  Responses carry a
-   monotonically increasing ``revision`` so the UI can discard late replies.
+4. ``revise_frames`` replaces at most 16 consecutive already-consumed frames
+   with recomputed probability rows and then re-runs the whole stream from
+   frame 0 on the new data: the beam search and every confirmation are replayed
+   at their original frame numbers.  The confirmed text is preserved; current
+   beams, historical replay data, confirmation scores and the stored undo
+   state (``beams_before``) are all rebuilt from the replay.  If the beam dies
+   or a confirmation is no longer reachable, the earliest failure is reported
+   and the session is left byte-for-byte untouched.
+5. Operations for one session are submitted to a single-worker executor, so
+   they are applied in arrival order: advance / undo / revision issued while a
+   replay is running are queued and see the post-replay state.  Responses carry
+   a monotonically increasing ``revision`` so the UI can discard late replies.
 """
 
 from __future__ import annotations
@@ -48,8 +57,22 @@ class SessionError(RuntimeError):
     """The requested operation is not valid for the session's current state."""
 
 
+class RevisionError(SessionError):
+    """A local frame revision could not be replayed.
+
+    Raised only *after* the whole replay has been attempted, before any session
+    field is mutated, so a failed revision leaves the original session intact.
+    The structured ``details`` payload is forwarded to the HTTP 409 response.
+    """
+
+    def __init__(self, message: str, details: dict) -> None:
+        super().__init__(message)
+        self.details = dict(details)
+
+
 MAX_FRAMES = 2000
 MAX_EXTRA_TOKENS = 8
+MAX_REVISE_FRAMES = 16
 
 
 @dataclass
@@ -75,6 +98,16 @@ class Confirmation:
 
 
 @dataclass
+class Revision:
+    """One accepted local frame revision, for the on-page revision history."""
+
+    seq: int
+    start_frame: int
+    end_frame: int  # exclusive boundary, i.e. frames start_frame .. end_frame-1
+    frame_count: int
+
+
+@dataclass
 class Session:
     id: str
     decoder: CTCBeamDecoder
@@ -84,6 +117,8 @@ class Session:
     next_frame: int = 0
     prefix: str = ""
     confirmations: List[Confirmation] = field(default_factory=list)
+    revisions: List[Revision] = field(default_factory=list)
+    revision_seq: int = 0
     seq: int = 0
     revision: int = 0
     error: Optional[str] = None
@@ -147,6 +182,8 @@ class Session:
             "best_text": self.best_text(),
             "beams": [beam_to_dict(b) for b in self.beams],
             "confirmations": [confirmation_to_dict(c) for c in self.confirmations],
+            "revisions": [revision_to_dict(r) for r in self.revisions],
+            "revision_count": len(self.revisions),
             "error": self.error,
         }
 
@@ -228,6 +265,15 @@ def confirmation_to_dict(record: Confirmation) -> dict:
     }
 
 
+def revision_to_dict(record: Revision) -> dict:
+    return {
+        "seq": record.seq,
+        "start_frame": record.start_frame,
+        "end_frame": record.end_frame,
+        "frame_count": record.frame_count,
+    }
+
+
 def _copy_beams(beams: Sequence[Beam]) -> List[Beam]:
     return [copy.copy(b) for b in beams]
 
@@ -284,6 +330,37 @@ def validate_frames(frames, vocab_size: int) -> np.ndarray:
             if number < 0.0 or number > 1.0:
                 raise DecodeError(f"第 {t} 帧第 {k} 个值不在 [0,1] 内")
             array[t, k] = number
+    return array
+
+
+def validate_revision_rows(rows, vocab_size: int) -> np.ndarray:
+    """Validate the replacement probability rows of a local revision.
+
+    Rows follow the original vocabulary order (index 0 = blank) and use the same
+    probability conventions as session creation: finite numbers in [0, 1]; a row
+    may sum to less than 1 (the decoder works with unnormalised per-label
+    probabilities), but an all-zero row is rejected because it would kill every
+    beam without carrying acoustic information.
+    """
+    if not isinstance(rows, list) or not rows:
+        raise DecodeError("修订概率行必须是非空数组")
+    if len(rows) > MAX_REVISE_FRAMES:
+        raise DecodeError(f"一次至多修订连续 {MAX_REVISE_FRAMES} 帧")
+    array = np.empty((len(rows), vocab_size), dtype=np.float64)
+    for t, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or len(row) != vocab_size:
+            raise DecodeError(f"修订第 {t} 行应有 {vocab_size} 个概率（按原词表顺序）")
+        for k, value in enumerate(row):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise DecodeError(f"修订第 {t} 行第 {k} 个值不是数字")
+            number = float(value)
+            if not np.isfinite(number):
+                raise DecodeError(f"修订第 {t} 行第 {k} 个值不是有限数")
+            if number < 0.0 or number > 1.0:
+                raise DecodeError(f"修订第 {t} 行第 {k} 个值不在 [0,1] 内")
+            array[t, k] = number
+        if not array[t].any():
+            raise DecodeError(f"修订第 {t} 行全为 0，该帧没有任何可达路径")
     return array
 
 
@@ -434,5 +511,202 @@ def undo(session: Session) -> None:
     session.confirmations.pop()
     session.prefix = record.prefix_before
     session.beams = beams
+    session.revision += 1
+    session.error = None
+
+
+# ---------------------------------------------------------------------------
+# Local frame revision
+#
+# Replacing already-consumed frames invalidates every derived quantity, so the
+# operation is implemented as a full deterministic replay on the patched frame
+# array rather than an incremental patch:
+#
+#   * the beam search is re-run from frame 0 one frame at a time, applying each
+#     confirmation at its original boundary, exactly as ``beams_at`` does;
+#   * each confirmation's exact CTC forward scores are recomputed on the new
+#     frames and its stored ``beams_before`` (the undo state) is rebuilt;
+#   * the confirmed texts themselves are preserved and used as the replay
+#     schedule, but the moment one of them is no longer reachable (or the
+#     restricted beam dies) the replay aborts and nothing is committed.
+#
+# All work happens on local copies; the session is only mutated after the replay
+# finishes successfully, so a failed revision leaves the original session --
+# frames, beams, confirmations, undo state and revision counter -- untouched.
+
+
+def _exact_scores(session: Session, frames: np.ndarray, text: str) -> tuple[float, float, float]:
+    """Exact CTC forward score (total, blank, non-blank) of ``text``."""
+    alpha = compute_prefix_alpha(frames, session.label_ids(text))
+    return prefix_alpha_scores(alpha)
+
+
+def _replay_revision(
+    session: Session, new_frames: np.ndarray
+) -> tuple[List[Beam], List[Confirmation]]:
+    """Replay the stream on patched frames; raise :class:`RevisionError` early.
+
+    Returns the live beam at the current frame and the rebuilt confirmation
+    records (same order and texts as the original ones).
+    """
+    decoder = session.decoder
+    # Confirmations grouped by their boundary, preserving submission order at a
+    # shared boundary (a second confirmation can be issued without advancing).
+    schedule: Dict[int, List[Confirmation]] = {}
+    for record in session.confirmations:
+        schedule.setdefault(record.frame, []).append(record)
+
+    rebuilt: List[Confirmation] = []
+    beams = decoder.initial_beams()
+    prefix = ""
+
+    def fail(kind: str, frame: int, message: str, **extra) -> None:
+        details = {"reason": kind, "frame": frame, **extra}
+        raise RevisionError(message, details)
+
+    boundary_records = schedule.get(0)
+    if boundary_records:
+        for record in boundary_records:
+            target = record.prefix_after
+            compatible = decoder.filter_compatible(beams, target)
+            if not compatible:
+                fail(
+                    "confirmation_unreachable",
+                    0,
+                    f"第 1 次失败：帧 0 处的确认「{target}」在新数据上不再可达，原会话已完整保留。",
+                    confirmation_seq=record.seq,
+                    prefix=target,
+                )
+            before_total, before_blank, before_nonblank = _exact_scores(
+                session, new_frames[:0], record.prefix_before
+            )
+            after_total, after_blank, after_nonblank = _exact_scores(
+                session, new_frames[:0], target
+            )
+            rebuilt.append(
+                Confirmation(
+                    seq=record.seq,
+                    prefix_before=record.prefix_before,
+                    prefix_after=target,
+                    frame=0,
+                    beams_before=_copy_beams(beams),
+                    last_char=target[-1],
+                    prefix_logp=before_total,
+                    prefix_logp_blank=before_blank,
+                    prefix_logp_nonblank=before_nonblank,
+                    confirmed_logp=after_total,
+                    confirmed_logp_blank=after_blank,
+                    confirmed_logp_nonblank=after_nonblank,
+                )
+            )
+            prefix = target
+            beams = compatible
+
+    for index in range(session.next_frame):
+        beams = decoder.step(beams, new_frames[index], prefix=prefix)
+        boundary = index + 1
+        if not beams:
+            fail(
+                "beam_lost",
+                boundary,
+                f"第 1 次失败：束在帧 {boundary} 之后消失（当前前缀「{prefix}」"
+                "已无任何可达路径），原会话已完整保留。",
+                prefix=prefix,
+            )
+        boundary_records = schedule.get(boundary)
+        if boundary_records:
+            for record in boundary_records:
+                target = record.prefix_after
+                compatible = [b for b in beams if b.text.startswith(target)]
+                if not compatible:
+                    exact, _, _ = _exact_scores(session, new_frames[:boundary], target)
+                    fail(
+                        "confirmation_unreachable",
+                        boundary,
+                        f"第 1 次失败：帧 {boundary} 处的确认「{target}」在新数据上不再可达"
+                        "（已不在束候选中），原会话已完整保留。",
+                        confirmation_seq=record.seq,
+                        prefix=target,
+                        exact_logp=finite_or_none(exact),
+                    )
+                before_total, before_blank, before_nonblank = _exact_scores(
+                    session, new_frames[:boundary], record.prefix_before
+                )
+                after_total, after_blank, after_nonblank = _exact_scores(
+                    session, new_frames[:boundary], target
+                )
+                rebuilt.append(
+                    Confirmation(
+                        seq=record.seq,
+                        prefix_before=record.prefix_before,
+                        prefix_after=target,
+                        frame=boundary,
+                        beams_before=_copy_beams(beams),
+                        last_char=target[-1],
+                        prefix_logp=before_total,
+                        prefix_logp_blank=before_blank,
+                        prefix_logp_nonblank=before_nonblank,
+                        confirmed_logp=after_total,
+                        confirmed_logp_blank=after_blank,
+                        confirmed_logp_nonblank=after_nonblank,
+                    )
+                )
+                prefix = target
+                beams = compatible
+                if not beams:
+                    fail(
+                        "beam_lost",
+                        boundary,
+                        f"第 1 次失败：束在帧 {boundary} 的确认后消失，原会话已完整保留。",
+                        prefix=prefix,
+                    )
+    return beams, rebuilt
+
+
+def revise_frames(session: Session, start_frame: int, rows) -> None:
+    """Replace a short run of consumed frames and replay the whole session.
+
+    See the module-level rules: at most :data:`MAX_REVISE_FRAMES` consecutive
+    frames inside ``[0, next_frame)`` may be replaced, rows follow the original
+    vocabulary order, and any replay failure raises before the session is
+    touched.  On success the frame arrays, live beams, confirmation records
+    (including their scores and undo snapshots) and the revision history are
+    updated; the confirmed text and frame progress do not change.
+    """
+    if isinstance(start_frame, bool) or not isinstance(start_frame, int):
+        raise SessionError("起始帧必须是整数")
+    if start_frame < 0:
+        raise SessionError("起始帧不能为负")
+    new_rows = validate_revision_rows(rows, session.decoder.vocab_size)
+    end_frame = start_frame + new_rows.shape[0]
+    if start_frame >= session.next_frame:
+        raise SessionError("只能修订已经推进过的帧")
+    if end_frame > session.next_frame:
+        raise SessionError(
+            f"修订区间 [{start_frame}, {end_frame}) 超出已推进帧（当前 {session.next_frame} 帧）"
+        )
+
+    # Patch copies first; nothing in the session changes until the replay wins.
+    new_frames = session.frames.copy()
+    new_probs = session.probs.copy()
+    with np.errstate(divide="ignore"):
+        new_frames[start_frame:end_frame] = np.log(new_rows)
+    new_probs[start_frame:end_frame] = new_rows
+
+    rebuilt_beams, rebuilt_confirmations = _replay_revision(session, new_frames)
+
+    session.frames = new_frames
+    session.probs = new_probs
+    session.beams = rebuilt_beams
+    session.confirmations = rebuilt_confirmations
+    session.revision_seq += 1
+    session.revisions.append(
+        Revision(
+            seq=session.revision_seq,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            frame_count=int(new_rows.shape[0]),
+        )
+    )
     session.revision += 1
     session.error = None

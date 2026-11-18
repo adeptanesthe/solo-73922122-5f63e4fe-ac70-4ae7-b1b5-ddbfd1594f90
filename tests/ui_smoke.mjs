@@ -132,6 +132,87 @@ check("零概率样例显示 -∞", bodyText.includes("-∞") || $("frame-probs"
 // 10. no uncaught UI errors
 check("无未捕获脚本错误", errors.length === 0, errors.join(" | ").slice(0, 200));
 
+// 11. local frame revision panel
+const repeatBtn2 = [...$("sample-buttons").children].find((b) => b.textContent.includes("sample_repeat"));
+repeatBtn2.click();
+await until(() => $("progress-text").textContent.startsWith("0 / 15"), "reload repeat sample");
+$("chunk-size").value = "4";
+$("chunk-size").dispatchEvent(new window.Event("input"));
+$("step-btn").click();
+await until(() => $("progress-text").textContent.startsWith("4 /"), "advance 4 frames");
+$("confirm-best").click();
+await until(() => $("confirmed-text").textContent.length > 0, "confirm before revision");
+const confirmedText = $("confirmed-text").textContent;
+
+// 11a. grid geometry: 1 row initially, grows with the frame-count slider
+check("修订网格初始 1 行", $("revise-grid").querySelectorAll("tbody tr").length === 1);
+$("revise-count").value = "3";
+$("revise-count").dispatchEvent(new window.Event("input"));
+check("修订网格随帧数变为 3 行", $("revise-grid").querySelectorAll("tbody tr").length === 3);
+check("修订网格列数等于词表", $("revise-grid").querySelectorAll("tbody tr")[0].querySelectorAll("input").length === 4);
+
+// 11b. prefill reads the live probabilities
+$("revise-start").value = "1";
+$("revise-start").dispatchEvent(new window.Event("input"));
+$("revise-prefill").click();
+await until(
+  () => [...$("revise-grid").querySelectorAll("tbody tr")[0].querySelectorAll("input")]
+    .every((i) => i.value !== ""),
+  "prefill populated",
+);
+const firstInputs = [...$("revise-grid").querySelectorAll("tbody tr")[0].querySelectorAll("input")];
+check("预填概率已写入", firstInputs.every((i) => Number(i.value) >= 0), firstInputs.map((i) => i.value).join(","));
+
+// 11c. identity revision preserves the confirmed text and records history
+$("revise-submit").click();
+await until(() => $("revise-list").children.length === 1, "revision applied");
+check("修订后确认文本保留", $("confirmed-text").textContent === confirmedText, $("confirmed-text").textContent);
+check("修订记录渲染", $("revise-list").children[0].textContent.includes("帧 1～3"),
+  $("revise-list").children[0].textContent);
+check("修订后候选非空", $("beam-body").children.length > 0);
+check("修订后无错误提示", $("revise-error").hidden);
+
+// 11d. invalid rows are blocked client-side and show an error
+const badInput = $("revise-grid").querySelectorAll("tbody input")[0];
+badInput.value = "1.7";
+$("revise-submit").click();
+await until(() => !$("revise-error").hidden, "client validation error");
+check("越界概率被前端拦截", $("revise-error").textContent.includes("标红"));
+check("非法单元格标红", badInput.classList.contains("invalid"));
+
+// 11e. normalize helper makes each row sum to 1
+badInput.value = "0.2";
+$("revise-normalize").click();
+const normalized = [...$("revise-grid").querySelectorAll("tbody tr")[0].querySelectorAll("input")]
+  .map((i) => Number(i.value));
+const sum = normalized.reduce((acc, v) => acc + v, 0);
+check("归一化后行和约为 1", Math.abs(sum - 1) < 0.01, String(sum));
+
+// 11f. a failing server replay surfaces the earliest failure and keeps state.
+// Four blank-only frames 0..3 make the frame-4 confirmation of "a" unreachable.
+$("revise-start").value = "0";
+$("revise-start").dispatchEvent(new window.Event("input"));
+$("revise-count").value = "4";
+$("revise-count").dispatchEvent(new window.Event("input"));
+check("失败场景网格为 4 行", $("revise-grid").querySelectorAll("tbody tr").length === 4);
+const allRows = [...$("revise-grid").querySelectorAll("tbody input")];
+check("失败场景单元格数为 4×词表", allRows.length === 16, String(allRows.length));
+// blank-only frames cannot support any non-empty confirmed prefix
+allRows.forEach((input, idx) => { input.value = idx % 4 === 0 ? "1" : "0"; });
+const progressBefore = $("progress-text").textContent;
+const confirmedBefore = $("confirmed-text").textContent;
+$("revise-submit").click();
+await until(() => !$("revise-error").hidden && $("revise-error").textContent.includes("第 1 次失败"),
+  "server replay failure", 20000);
+check("重演失败显示最早失败处", $("revise-error").textContent.includes("原会话已完整保留"),
+  $("revise-error").textContent);
+check("失败后进度保留", $("progress-text").textContent === progressBefore);
+check("失败后确认文本保留", $("confirmed-text").textContent === confirmedBefore);
+check("失败不新增修订记录", $("revise-list").children.length === 1);
+
+// 11g. no uncaught errors after the whole revision workflow
+check("修订流程无未捕获脚本错误", errors.length === 0, errors.join(" | ").slice(0, 200));
+
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
 process.exit(failed.length ? 1 : 0);

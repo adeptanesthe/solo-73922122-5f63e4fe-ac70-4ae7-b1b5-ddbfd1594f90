@@ -213,6 +213,196 @@ def test_manager_cleanup_after_delete(client):
     assert client.get(f"/api/sessions/{sid}").status_code == 404
 
 
+# ------------------------------------------------------------------ revisions
+
+
+def test_revise_endpoint_replays_and_preserves_confirmation(client):
+    session = create(client)
+    sid = session["session_id"]
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 3})
+    state = client.get(f"/api/sessions/{sid}").json()
+    target = state["beams"][0]["text"]
+    assert target
+    client.post("/api/confirm", json={"session_id": sid, "prefix": target})
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 5})
+
+    # Identity revision: identical rows must leave every beam and score intact.
+    response = client.post(
+        "/api/revise",
+        json={"session_id": sid, "start_frame": 2, "rows": FRAMES[2:4]},
+    )
+    assert response.status_code == 200, response.text
+    revised = response.json()
+    assert revised["prefix"] == target
+    assert revised["revision_count"] == 1
+    assert revised["revisions"][0] == {"seq": 1, "start_frame": 2, "end_frame": 4, "frame_count": 2}
+    expected = client.get(f"/api/sessions/{sid}").json()
+    assert revised["beams"] == expected["beams"]
+    assert revised["confirmations"][0]["confirmed_logp"] is not None
+
+    # The patched frame is what frame inspection now reports.
+    peek = client.post("/api/peek", json={"session_id": sid, "frame": 3}).json()
+    assert peek["frame_info"]["probs"] == [float(v) for v in FRAMES[3]]
+
+
+def test_revise_endpoint_applies_new_probabilities(client):
+    session = create(client)
+    sid = session["session_id"]
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 5})
+    patched = [[0.05, 0.9, 0.05]]
+    response = client.post(
+        "/api/revise",
+        json={"session_id": sid, "start_frame": 1, "rows": patched},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["next_frame"] == 5
+    # frame 1 now carries the replacement row
+    peek = client.post("/api/peek", json={"session_id": sid, "frame": 1}).json()
+    assert peek["frame_info"]["probs"] == patched[0]
+    # history replay at frame 1 reflects the new data
+    assert peek["beams"]
+
+
+def test_revise_failure_returns_409_with_earliest_failure_and_keeps_state(client):
+    session = create(client)
+    sid = session["session_id"]
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 3})
+    state = client.get(f"/api/sessions/{sid}").json()
+    target = state["beams"][0]["text"]
+    client.post("/api/confirm", json={"session_id": sid, "prefix": target})
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 5})
+    before = client.get(f"/api/sessions/{sid}").json()
+
+    response = client.post(
+        "/api/revise",
+        json={
+            "session_id": sid,
+            "start_frame": 1,
+            "rows": [[0.05, 0.95, 0.0], [0.05, 0.95, 0.0]],
+        },
+    )
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["reason"] in {"beam_lost", "confirmation_unreachable"}
+    assert isinstance(detail["frame"], int)
+    assert "第 1 次失败" in detail["message"]
+
+    after = client.get(f"/api/sessions/{sid}").json()
+    assert after == before
+    assert after["revision_count"] == 0
+
+
+def test_revise_validation_errors_are_400_and_non_mutating(client):
+    session = create(client)
+    sid = session["session_id"]
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 3})
+    before = client.get(f"/api/sessions/{sid}").json()
+
+    base = {"session_id": sid}
+    bad_payloads = [
+        {**base, "start_frame": 0, "rows": [[0.5, 0.5]]},                # wrong width
+        {**base, "start_frame": 0, "rows": [[1.1, -0.1, 0.0]]},          # out of range
+        {**base, "start_frame": 0, "rows": [[0.0, 0.0, 0.0]]},           # all zero
+        {**base, "start_frame": 0, "rows": [[0.5, 0.4, 0.1]] * 17},      # too many
+        {**base, "start_frame": 3, "rows": [[0.5, 0.4, 0.1]]},           # not consumed
+        {**base, "start_frame": -1, "rows": [[0.5, 0.4, 0.1]]},          # negative start
+    ]
+    for payload in bad_payloads:
+        response = client.post("/api/revise", json=payload)
+        assert response.status_code in (400, 409), payload
+    after = client.get(f"/api/sessions/{sid}").json()
+    assert after == before
+
+
+def test_revise_unknown_session_is_404(client):
+    response = client.post(
+        "/api/revise",
+        json={"session_id": "nope", "start_frame": 0, "rows": [[0.5, 0.4, 0.1]]},
+    )
+    assert response.status_code == 404
+
+
+def test_revise_interleaved_with_advance_and_undo_applies_in_order(client):
+    """Revision, advance and undo share the ordered worker; all must apply."""
+    session = create(client)
+    sid = session["session_id"]
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 3})
+    state = client.get(f"/api/sessions/{sid}").json()
+    target = state["beams"][0]["text"]
+    client.post("/api/confirm", json={"session_id": sid, "prefix": target})
+
+    rev = client.post(
+        "/api/revise",
+        json={"session_id": sid, "start_frame": 2, "rows": FRAMES[2:3]},
+    )
+    assert rev.status_code == 200
+    adv = client.post("/api/advance", json={"session_id": sid, "to_frame": 5})
+    assert adv.status_code == 200
+    undo_resp = client.post("/api/undo", json={"session_id": sid})
+    assert undo_resp.status_code == 200
+    final = client.get(f"/api/sessions/{sid}").json()
+    assert final["next_frame"] == 5
+    assert final["prefix"] == ""
+    assert final["revision_count"] == 1
+    revisions = [rev.json()["revision"], adv.json()["revision"], undo_resp.json()["revision"]]
+    assert revisions == sorted(revisions) and len(set(revisions)) == 3
+
+
+def test_slow_revision_does_not_swallow_later_action(monkeypatch):
+    """A slow revision replay must not lose an advance issued while it runs."""
+    import asyncio
+    import time
+
+    import httpx
+
+    from app import state as state_module
+
+    original = state_module.revise_frames
+
+    def slow_revise(session, start_frame, rows):
+        time.sleep(0.4)
+        return original(session, start_frame, rows)
+
+    monkeypatch.setattr(state_module, "revise_frames", slow_revise)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            created = (
+                await http.post(
+                    "/api/sessions",
+                    json={"vocab": VOCAB, "beam_width": 4, "frames": FRAMES},
+                )
+            ).json()
+            sid = created["session_id"]
+            await http.post("/api/advance", json={"session_id": sid, "to_frame": 5})
+
+            revise_task = asyncio.create_task(
+                http.post(
+                    "/api/revise",
+                    json={"session_id": sid, "start_frame": 0, "rows": FRAMES[0:1]},
+                )
+            )
+            await asyncio.sleep(0.05)
+            # Cannot advance beyond the end; undo nothing to confirm ordering,
+            # so issue a same-frame no-op advance which still queues behind.
+            advance_task = asyncio.create_task(
+                http.post("/api/advance", json={"session_id": sid, "to_frame": 5})
+            )
+            revise_response, advance_response = await asyncio.gather(revise_task, advance_task)
+            final = (await http.get(f"/api/sessions/{sid}")).json()
+            return revise_response, advance_response, final
+
+    revise_response, advance_response, final = asyncio.run(scenario())
+    assert revise_response.status_code == 200
+    assert advance_response.status_code == 200
+    assert final["revision_count"] == 1
+    assert final["next_frame"] == 5
+    assert revise_response.json()["revision"] <= final["revision"]
+
+
 def test_slow_recompute_does_not_swallow_later_actions(monkeypatch):
     """A slow undo replay must not lose an advance issued while it runs.
 

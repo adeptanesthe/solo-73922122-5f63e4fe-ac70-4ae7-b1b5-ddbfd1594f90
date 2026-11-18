@@ -8,6 +8,7 @@ import pytest
 
 from app.decoder import (
     CTCBeamDecoder,
+    DecodeError,
     NEG_INF,
     compute_prefix_alpha,
     is_compatible,
@@ -15,12 +16,16 @@ from app.decoder import (
 )
 from app.state import (
     MAX_FRAMES,
+    MAX_REVISE_FRAMES,
+    RevisionError,
     SessionError,
     SessionManager,
     advance,
     confirm,
+    revise_frames,
     undo,
     validate_frames,
+    validate_revision_rows,
     validate_vocab,
 )
 
@@ -421,3 +426,249 @@ def test_beam_width_bounds():
             CTCBeamDecoder(VOCAB, width)
     CTCBeamDecoder(VOCAB, 1)
     CTCBeamDecoder(VOCAB, 16)
+
+
+# ----------------------------------------------------------------- frame revision
+
+
+REVISE_FRAMES = [
+    [0.6, 0.4, 0.0],
+    [0.1, 0.8, 0.1],
+    [0.5, 0.0, 0.5],
+    [0.2, 0.3, 0.5],
+    [0.7, 0.2, 0.1],
+]
+
+
+def _beam_signature(session):
+    return [(b.text, b.logp, b.logp_blank, b.logp_nonblank) for b in session.beams]
+
+
+def test_identity_revision_reproduces_state_bit_for_bit():
+    manager, session = make_session(frames=REVISE_FRAMES, width=4)
+    advance(session, 3)
+    confirm(session, session.beams[0].text)
+    advance(session, 5)
+    history_before = {
+        f: [(b.text, b.logp) for b in session.beams_at(f)] for f in range(6)
+    }
+    scores_before = [
+        (c.confirmed_logp, c.confirmed_logp_blank, c.confirmed_logp_nonblank)
+        for c in session.confirmations
+    ]
+
+    revise_frames(session, 2, REVISE_FRAMES[2:4])
+
+    assert session.prefix == session.confirmations[0].prefix_after
+    assert len(session.revisions) == 1
+    assert (session.revisions[0].start_frame, session.revisions[0].end_frame) == (2, 4)
+    # live beam identical
+    reference = manager.create(VOCAB, 4, REVISE_FRAMES)
+    advance(reference, 3)
+    confirm(reference, reference.beams[0].text)
+    advance(reference, 5)
+    assert _beam_signature(session) == _beam_signature(reference)
+    # historical replay identical at every boundary
+    for f in range(6):
+        assert [(b.text, b.logp) for b in session.beams_at(f)] == history_before[f]
+    # confirmation scores unchanged
+    scores_after = [
+        (c.confirmed_logp, c.confirmed_logp_blank, c.confirmed_logp_nonblank)
+        for c in session.confirmations
+    ]
+    assert scores_after == scores_before
+
+
+def test_revision_matches_fresh_session_built_from_patched_frames():
+    manager, session = make_session(frames=REVISE_FRAMES, width=4)
+    advance(session, 2)
+    confirm(session, session.beams[0].text)
+    advance(session, 5)
+
+    patched = [row[:] for row in REVISE_FRAMES]
+    patched[1] = [0.05, 0.9, 0.05]
+    patched[2] = [0.1, 0.8, 0.1]
+    revise_frames(session, 1, patched[1:3])
+
+    assert [list(row) for row in session.probs[1:3]] == patched[1:3]
+    reference = manager.create(VOCAB, 4, patched)
+    advance(reference, 2)
+    target = reference.beams[0].text
+    # The original confirmation text must be the same one reachable on new data.
+    assert target == session.confirmations[0].prefix_after
+    confirm(reference, target)
+    advance(reference, 5)
+    assert _beam_signature(session) == _beam_signature(reference)
+
+
+def test_revision_rebuilds_undo_state_and_undo_stays_exact():
+    manager, session = make_session(frames=REVISE_FRAMES, width=3)
+    advance(session, 2)
+    confirm(session, session.beams[0].text)
+    advance(session, 5)
+
+    patched = [row[:] for row in REVISE_FRAMES]
+    patched[0] = [0.2, 0.7, 0.1]
+    revise_frames(session, 0, [patched[0]])
+
+    # Undo after revision must equal an unrestricted replay on patched frames.
+    undo(session)
+    assert session.prefix == ""
+    reference = manager.create(VOCAB, 3, patched)
+    advance(reference, 5)
+    assert _beam_signature(session) == _beam_signature(reference)
+
+
+def test_revision_recomputes_confirmation_scores_on_new_frames():
+    manager, session = make_session(frames=REVISE_FRAMES, width=4)
+    advance(session, 3)
+    target = session.beams[0].text
+    confirm(session, target)
+    old_score = session.confirmations[0].confirmed_logp
+
+    # Make the confirmed text much more likely on an early frame: its exact
+    # forward score must improve (less negative).
+    revised = [[0.05, 0.9, 0.05]]
+    revise_frames(session, 1, revised)
+    new_score = session.confirmations[0].confirmed_logp
+    assert session.confirmations[0].prefix_after == target
+    assert new_score != old_score
+    # And it must equal a from-scratch exact forward computation.
+    total, _, _ = session.prefix_scores(target)
+    assert close(total, new_score)
+
+
+def test_failed_revision_reports_earliest_failure_and_keeps_session():
+    manager, session = make_session(frames=REVISE_FRAMES, width=4)
+    advance(session, 3)
+    target = session.beams[0].text
+    assert "b" in target  # "ab" with these frames
+    confirm(session, target)
+    advance(session, 5)
+
+    snap = (
+        session.frames.copy(),
+        session.probs.copy(),
+        _beam_signature(session),
+        session.revision,
+        len(session.confirmations),
+        len(session.revisions),
+        session.prefix,
+    )
+    # All-"a" frames covering frame 2, the only early frame emitting "b", make
+    # the confirmed "ab" unreachable at its original frame-3 boundary.
+    bad_rows = [[0.05, 0.95, 0.0], [0.05, 0.95, 0.0]]
+    with pytest.raises(RevisionError) as exc:
+        revise_frames(session, 1, bad_rows)
+    details = exc.value.details
+    assert details["reason"] in {"beam_lost", "confirmation_unreachable"}
+    assert details["frame"] >= 1
+    assert details["prefix"] == target
+    assert "第 1 次失败" in str(exc.value)
+
+    frames, probs, beams, rev, n_conf, n_rev, prefix = snap
+    assert (session.frames == frames).all()
+    assert (session.probs == probs).all()
+    assert _beam_signature(session) == beams
+    assert session.revision == rev
+    assert len(session.confirmations) == n_conf
+    assert len(session.revisions) == n_rev
+    assert session.prefix == prefix
+
+
+def test_revision_fails_when_beam_dies_from_blank_only_frames():
+    manager, session = make_session(frames=REVISE_FRAMES, width=4)
+    advance(session, 2)
+    confirm(session, session.beams[0].text)
+    advance(session, 5)
+    # Frames that only allow blank are valid inputs but kill a non-empty
+    # confirmed prefix once its blank-ending mass is exhausted at pruning.
+    rows = [[1.0, 0.0, 0.0]] * 3
+    with pytest.raises(RevisionError) as exc:
+        revise_frames(session, 0, rows)
+    # Either the prefix itself becomes unreachable or the restricted beam dies.
+    assert exc.value.details["reason"] in {"beam_lost", "confirmation_unreachable"}
+    assert session.prefix  # original session retained
+
+
+def test_revision_validation_rules():
+    manager, session = make_session(frames=REVISE_FRAMES, width=4)
+    advance(session, 3)
+    with pytest.raises(SessionError):
+        revise_frames(session, 3, [[0.5, 0.4, 0.1]])  # not consumed yet
+    with pytest.raises(SessionError):
+        revise_frames(session, -1, [[0.5, 0.4, 0.1]])
+    with pytest.raises(DecodeError):
+        revise_frames(session, 0, [[0.5, 0.4]])  # wrong vocab width
+    with pytest.raises(DecodeError):
+        revise_frames(session, 0, [[1.2, -0.2, 0.0]])
+    with pytest.raises(DecodeError):
+        revise_frames(session, 0, [[0.0, 0.0, 0.0]])  # all-zero row
+    with pytest.raises(DecodeError):
+        validate_revision_rows([[0.5, 0.4, 0.1]] * (MAX_REVISE_FRAMES + 1), 3)
+    # boundary exactly at next_frame is accepted for the last consumed frame
+    revise_frames(session, 2, REVISE_FRAMES[2:3])
+    assert session.revisions[-1].end_frame == 3
+
+
+def test_multiple_revisions_compose_and_history_follows_new_data():
+    manager, session = make_session(frames=REVISE_FRAMES, width=4)
+    advance(session, 4)
+    revise_frames(session, 0, [[0.2, 0.7, 0.1]])
+    first = _beam_signature(session)
+    revise_frames(session, 3, [[0.1, 0.1, 0.8]])
+    assert len(session.revisions) == 2
+    assert session.revisions[0].seq == 1 and session.revisions[1].seq == 2
+
+    patched = [row[:] for row in REVISE_FRAMES]
+    patched[0] = [0.2, 0.7, 0.1]
+    patched[3] = [0.1, 0.1, 0.8]
+    reference = manager.create(VOCAB, 4, patched)
+    advance(reference, 4)
+    assert _beam_signature(session) == _beam_signature(reference)
+    assert first != _beam_signature(session)
+    # peek/history replay uses the patched frames too
+    assert [(b.text, b.logp) for b in session.beams_at(2)] == [
+        (b.text, b.logp) for b in reference.beams_at(2)
+    ]
+
+
+def test_revision_with_nested_confirmations_replays_all_of_them():
+    frames = [
+        [0.1, 0.8, 0.1],
+        [0.8, 0.1, 0.1],
+        [0.1, 0.8, 0.1],
+        [0.8, 0.1, 0.1],
+        [0.1, 0.1, 0.8],
+    ]
+    manager, session = make_session(frames=frames, width=6)
+    advance(session, 2)
+    confirm(session, "a")
+    advance(session, 4)
+    if any(b.text == "aa" for b in session.beams):
+        confirm(session, "aa")
+    advance(session, 5)
+
+    revise_frames(session, 0, [frames[0]])  # identity on frame 0
+    texts = [c.prefix_after for c in session.confirmations]
+    assert texts and all(t.startswith("a") for t in texts)
+    reference = manager.create(VOCAB, 6, frames)
+    advance(reference, 2)
+    confirm(reference, "a")
+    advance(reference, 4)
+    if any(b.text == "aa" for b in reference.beams):
+        confirm(reference, "aa")
+    advance(reference, 5)
+    assert _beam_signature(session) == _beam_signature(reference)
+    # undo chain still works after the replay
+    while session.confirmations:
+        undo(session)
+    assert session.prefix == ""
+
+
+def test_validate_revision_rows_helper():
+    rows = validate_revision_rows([[0.2, 0.8], [1.0, 0.0]], 2)
+    assert rows.shape == (2, 2)
+    for bad in ([], [[0.5]], [[float("nan"), 1.0]], [["1", "0"]], [[True, False]]):
+        with pytest.raises(DecodeError):
+            validate_revision_rows(bad, 2)

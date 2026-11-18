@@ -53,6 +53,16 @@
     frameProbs: $("frame-probs"),
     historyList: $("history-list"),
     historyEmpty: $("history-empty"),
+    reviseStart: $("revise-start"),
+    reviseCount: $("revise-count"),
+    reviseCountOut: $("revise-count-out"),
+    revisePrefill: $("revise-prefill"),
+    reviseNormalize: $("revise-normalize"),
+    reviseSubmit: $("revise-submit"),
+    reviseGrid: $("revise-grid"),
+    reviseError: $("revise-error"),
+    reviseList: $("revise-list"),
+    reviseEmpty: $("revise-empty"),
     busy: $("busy"),
     busyText: $("busy-text"),
   };
@@ -70,6 +80,10 @@
     // Behind the scenes: the last shown state is kept while a request is in
     // flight, so a failed operation leaves the subtitles and progress intact.
     peekLive: false,
+    // Signature of the revision grid currently in the DOM; rebuilt only when
+    // the vocabulary or the row geometry changes, so typed values survive
+    // unrelated re-renders.
+    gridSignature: "",
   };
 
   // ---------------------------------------------------------------- helpers
@@ -150,6 +164,11 @@
     els.applyPrefix.disabled = !ready;
     els.stopBtn.hidden = !state.running;
     els.resetBtn.disabled = !ready;
+    els.reviseSubmit.disabled = !ready || state.pending > 0;
+    els.revisePrefill.disabled = !ready || state.pending > 0;
+    els.reviseNormalize.disabled = !ready;
+    els.reviseStart.disabled = !ready;
+    els.reviseCount.disabled = !ready;
   }
 
   async function api(path, options = {}) {
@@ -193,6 +212,13 @@
     state.snapshot = null;
     state.loadedSample = sampleName;
     state.peekLive = true;
+    state.gridSignature = "";
+    els.reviseStart.value = "0";
+    els.reviseCount.value = "1";
+    els.reviseCountOut.textContent = "1";
+    els.reviseGrid.innerHTML = "";
+    els.reviseList.innerHTML = "";
+    showReviseError("");
     applyState(payload, { force: true });
     if (state.snapshot) {
       els.peekFrame.value = "0";
@@ -248,6 +274,13 @@
 
     renderHistory(snap);
     renderFrameProbs(snap.frame_info);
+    els.reviseStart.max = String(Math.max(0, total - 1));
+    if (Number(els.reviseStart.value) > snap.next_frame - 1) {
+      els.reviseStart.value = String(Math.max(0, snap.next_frame - 1));
+    }
+    clampRevisionRange(snap);
+    syncReviseGrid(snap);
+    renderRevisions(snap);
     els.prefixInput.placeholder = prefix ? `当前前缀：${prefix}` : "例如：啊";
     updateButtons();
     updateStatusFromSnapshot();
@@ -355,6 +388,237 @@
       cell.append(tok, val);
       cell.title = `log P = ${info.log_probs && info.log_probs[index] !== null ? Number(info.log_probs[index]).toFixed(4) : "-∞"}`;
       els.frameProbs.appendChild(cell);
+    });
+  }
+
+  // ----------------------------------------------------------- local revision
+
+  function reviseGeometry(snap) {
+    const start = Math.max(0, Number(els.reviseStart.value) || 0);
+    const count = Math.max(1, Number(els.reviseCount.value) || 1);
+    return { start, count, end: start + count, done: snap ? snap.next_frame : 0 };
+  }
+
+  function clampRevisionRange(snap) {
+    if (!snap || snap.next_frame <= 0) return;
+    const { start, count } = reviseGeometry(snap);
+    const maxCount = Math.max(1, Math.min(16, snap.next_frame - start));
+    if (Number(els.reviseCount.max) !== maxCount) els.reviseCount.max = String(maxCount);
+    if (count > maxCount) {
+      els.reviseCount.value = String(maxCount);
+      els.reviseCountOut.textContent = String(maxCount);
+    }
+  }
+
+  // Rebuild the probability editor only when its shape changes; normal state
+  // refreshes keep the user's typed rows.
+  function syncReviseGrid(snap) {
+    if (!snap) return;
+    const { start, count } = reviseGeometry(snap);
+    const vocab = snap.vocab || [];
+    const signature = `${start}|${count}|${vocab.join(",")}`;
+    if (signature === state.gridSignature) return;
+    state.gridSignature = signature;
+
+    const table = els.reviseGrid;
+    table.innerHTML = "";
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    const corner = document.createElement("th");
+    corner.textContent = "帧 \\ 词表";
+    headRow.appendChild(corner);
+    vocab.forEach((token, index) => {
+      const th = document.createElement("th");
+      th.textContent = index === 0 ? "<blank>" : token;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    for (let i = 0; i < count; i += 1) {
+      const tr = document.createElement("tr");
+      const tag = document.createElement("td");
+      tag.className = "frame-tag";
+      tag.textContent = `帧 ${start + i}`;
+      tr.appendChild(tag);
+      for (let k = 0; k < vocab.length; k += 1) {
+        const td = document.createElement("td");
+        const input = document.createElement("input");
+        input.type = "text";
+        input.inputMode = "decimal";
+        input.autocomplete = "off";
+        input.dataset.row = String(i);
+        input.dataset.col = String(k);
+        input.placeholder = "0.0";
+        input.addEventListener("input", () => input.classList.remove("invalid"));
+        td.appendChild(input);
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+  }
+
+  function reviseInputs() {
+    return [...els.reviseGrid.querySelectorAll("tbody input")];
+  }
+
+  function collectRevisionRows() {
+    const inputs = reviseInputs();
+    const cols = state.snapshot ? state.snapshot.vocab.length : 0;
+    const rowCount = inputs.length / Math.max(1, cols);
+    const rows = [];
+    for (let i = 0; i < rowCount; i += 1) {
+      const row = new Array(cols).fill(0);
+      let rowOk = true;
+      for (let k = 0; k < cols; k += 1) {
+        const input = inputs[i * cols + k];
+        const raw = input.value.trim();
+        if (raw === "") { input.classList.add("invalid"); rowOk = false; continue; }
+        const value = Number(raw);
+        if (!Number.isFinite(value) || value < 0 || value > 1) {
+          input.classList.add("invalid");
+          rowOk = false;
+          continue;
+        }
+        input.classList.remove("invalid");
+        row[k] = value;
+      }
+      if (!rowOk) return null;
+      if (!row.some((v) => v > 0)) return null;
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  function showReviseError(message) {
+    if (!message) { els.reviseError.hidden = true; els.reviseError.textContent = ""; return; }
+    els.reviseError.hidden = false;
+    els.reviseError.textContent = message;
+  }
+
+  async function prefillRevision() {
+    const snap = state.snapshot;
+    if (!snap) return;
+    const { start, count, end, done } = reviseGeometry(snap);
+    if (start >= done) {
+      showReviseError(`起始帧 ${start} 尚未推进（当前仅推进到 ${done} 帧），无法读取概率。`);
+      return;
+    }
+    if (end > done) {
+      showReviseError(`区间 [${start}, ${end}) 超出已推进帧（当前 ${done} 帧），请缩短连续帧数。`);
+      return;
+    }
+    showReviseError("");
+    try {
+      const payloads = await Promise.all(
+        Array.from({ length: count }, (_, i) =>
+          api("/api/peek", {
+            method: "POST",
+            body: JSON.stringify({ session_id: state.sessionId, frame: start + i }),
+          })
+        )
+      );
+      const vocabLen = snap.vocab.length;
+      const inputs = reviseInputs();
+      payloads.forEach((payload, i) => {
+        const probs = payload.frame_info.probs;
+        for (let k = 0; k < vocabLen; k += 1) {
+          const input = inputs[i * vocabLen + k];
+          input.value = String(probs[k]);
+          input.classList.remove("invalid");
+        }
+      });
+      showNotice(`已读取帧 ${start}～${end - 1} 的当前概率，可直接修改后提交。`);
+    } catch (error) {
+      showReviseError(`读取当前概率失败：${error.message}`);
+    }
+  }
+
+  function normalizeRevisionRows() {
+    const rows = collectRevisionRows();
+    if (!rows) {
+      showReviseError("请先把每个单元格填成 [0,1] 内的数字，且每行至少一个正值，再归一化。");
+      return;
+    }
+    const inputs = reviseInputs();
+    const cols = state.snapshot.vocab.length;
+    showReviseError("");
+    rows.forEach((row, i) => {
+      const total = row.reduce((acc, v) => acc + v, 0);
+      row.forEach((value, k) => {
+        const normalised = total > 0 ? value / total : 0;
+        inputs[i * cols + k].value = normalised.toFixed(4);
+        inputs[i * cols + k].classList.remove("invalid");
+      });
+    });
+  }
+
+  async function submitRevision() {
+    const snap = state.snapshot;
+    if (!snap) return;
+    const { start, count, end, done } = reviseGeometry(snap);
+    if (start >= done || end > done) {
+      showReviseError(`只能修订已推进的帧：当前推进到 ${done} 帧，区间 [${start}, ${end}) 不合法。`);
+      return;
+    }
+    if (count > 16) {
+      showReviseError("一次至多修订连续 16 帧。");
+      return;
+    }
+    const rows = collectRevisionRows();
+    if (!rows) {
+      showReviseError("请检查标红单元格：每行需要与词表等长的 [0,1] 数字，且不能全为 0。");
+      return;
+    }
+    showReviseError("");
+    const sessionId = state.sessionId;
+    const generation = state.generation;
+    await withBusy("局部修订并重演…", async () => {
+      try {
+        const payload = await api("/api/revise", {
+          method: "POST",
+          body: JSON.stringify({ session_id: sessionId, start_frame: start, rows }),
+        });
+        if (generation !== state.generation) return;
+        if (applyState(payload)) {
+          showError("");
+          showNotice(
+            `已用新概率重演帧 ${start}～${end - 1}：确认文本保留，候选、历史回放、确认分数与撤销状态均已更新。`
+          );
+          els.peekFrame.value = String(payload.next_frame);
+        }
+      } catch (error) {
+        if (generation !== state.generation) return;
+        // A failed replay never mutates the session: show the earliest failure
+        // and leave subtitles, progress and the typed rows untouched.
+        let detail = error.message;
+        try {
+          const parsed = JSON.parse(error.message);
+          if (parsed && parsed.message) detail = parsed.message;
+        } catch { /* plain string detail */ }
+        showReviseError(`修订失败：${detail}`);
+      }
+    });
+  }
+
+  function renderRevisions(snap) {
+    const list = snap.revisions || [];
+    els.reviseList.innerHTML = "";
+    els.reviseEmpty.hidden = list.length > 0;
+    list.forEach((entry) => {
+      const li = document.createElement("li");
+      const left = document.createElement("span");
+      const badge = document.createElement("span");
+      badge.className = "h-meta";
+      badge.textContent = `#${entry.seq} 修订`;
+      const range = document.createElement("span");
+      range.className = "h-prefix";
+      range.textContent = `帧 ${entry.start_frame}～${entry.end_frame - 1}（${entry.frame_count} 帧）`;
+      left.append(badge, document.createTextNode("  "), range);
+      li.appendChild(left);
+      els.reviseList.appendChild(li);
     });
   }
 
@@ -637,6 +901,25 @@
     els.peekFrameOut.textContent = `${frame} / ${els.peekFrame.max}`;
     peek(frame);
   });
+
+  // ------------------------------------------------------------- revision UI
+
+  els.reviseCount.addEventListener("input", () => {
+    els.reviseCountOut.textContent = els.reviseCount.value;
+    if (state.snapshot) {
+      clampRevisionRange(state.snapshot);
+      syncReviseGrid(state.snapshot);
+    }
+  });
+  els.reviseStart.addEventListener("input", () => {
+    if (state.snapshot) {
+      clampRevisionRange(state.snapshot);
+      syncReviseGrid(state.snapshot);
+    }
+  });
+  els.revisePrefill.addEventListener("click", prefillRevision);
+  els.reviseNormalize.addEventListener("click", normalizeRevisionRows);
+  els.reviseSubmit.addEventListener("click", submitRevision);
 
   async function loadSamples() {
     try {
